@@ -1,0 +1,697 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code Starter Kit — GitHub Actions Pipeline
+#
+# SETUP REQUIRED (add these in GitHub → Settings → Secrets and variables → Actions):
+#
+#   Required for all projects:
+#   SONAR_TOKEN          → SonarQube/SonarCloud token (for /quality-gate)
+#   SONAR_HOST_URL       → Your SonarQube URL (e.g. https://sonarcloud.io)
+#
+#   Required for security scanning:
+#   SNYK_TOKEN           → Snyk.io token (optional — falls back to npm audit)
+#
+#   Required for deployment:
+#   STAGING_URL          → Staging environment URL (for smoke tests)
+#   PRODUCTION_URL       → Production environment URL (for smoke tests)
+#   DEPLOY_KEY           → Your deployment mechanism's secret
+#
+#   Optional (for advanced testing):
+#   STRIPE_TEST_KEY      → Payment integration tests
+#   PACT_BROKER_URL      → Contract test broker URL
+#   PACT_BROKER_TOKEN    → Contract test broker token
+#
+# CUSTOMISE FOR YOUR STACK:
+#   1. Replace `npm` commands with your package manager (yarn, pnpm, pip, mvn, gradle)
+#   2. Replace `npm test` with your test command
+#   3. Add/remove jobs based on what your project uses
+#   4. Set the correct `node-version` / `python-version` / `java-version`
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+  schedule:
+    - cron: '0 2 * * 1'   # Weekly: Monday 2am UTC (mutation + chaos + nfr)
+  workflow_dispatch:        # Manual trigger
+
+env:
+  NODE_VERSION: '20'
+  # Add: PYTHON_VERSION: '3.12'  or  JAVA_VERSION: '21'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — VERIFY (every commit, < 5 min)
+# Fast checks that catch obvious problems immediately.
+# Runs on: every push to any branch, every PR
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  verify:
+    name: Verify (lint + type-check + unit tests)
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed for SonarQube
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      # ── Uncomment for Python projects ──
+      # - uses: actions/setup-python@v5
+      #   with:
+      #     python-version: ${{ env.PYTHON_VERSION }}
+      #     cache: 'pip'
+
+      # ── Uncomment for Java projects ──
+      # - uses: actions/setup-java@v4
+      #   with:
+      #     java-version: ${{ env.JAVA_VERSION }}
+      #     distribution: 'temurin'
+      #     cache: 'maven'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          # pip install -r requirements.txt
+          # mvn dependency:resolve -q
+
+      - name: Lint and type-check
+        run: |
+          npm run lint
+          npm run type-check
+          # python -m ruff check .
+          # python -m mypy src/
+          # mvn checkstyle:check
+
+      - name: Unit tests
+        run: |
+          npm run test:unit -- --coverage
+          # pytest tests/unit/ --tb=short --cov=src --cov-report=xml
+          # mvn test -Dtest="**/*UnitTest"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 — INTEGRATION TESTS (every PR, needs real services)
+# Tests module boundaries and service connections.
+# Runs on: pull_request events only
+# ─────────────────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-retries 5
+
+      # ── Uncomment for RabbitMQ ──
+      # rabbitmq:
+      #   image: rabbitmq:3-management
+      #   ports:
+      #     - 5672:5672
+      #   options: --health-cmd "rabbitmq-diagnostics ping" --health-interval 10s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Run database migrations
+        run: |
+          npm run migrate
+          # python manage.py migrate
+          # mvn flyway:migrate
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+
+      - name: Integration tests
+        run: |
+          npm run test:integration
+          # pytest tests/integration/ --tb=short
+          # mvn test -Dtest="**/*IntegrationTest"
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+
+      - name: Contract tests (Pact)
+        run: |
+          npm run test:contract
+          # python -m pytest tests/contract/
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+        continue-on-error: true   # Remove once Pact is configured
+
+      - name: Data tests (schema + quality)
+        run: |
+          npm run test:data
+          # pytest tests/data/ --tb=short
+          # dbt test
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        if: contains(github.event.pull_request.changed_files, 'migration') ||
+            contains(github.event.pull_request.changed_files, 'schema')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 3 — QUALITY GATE (every PR)
+# Static analysis, complexity, duplication, coverage thresholds.
+# Blocks merge if gate fails.
+# ─────────────────────────────────────────────────────────────────────────────
+  quality-gate:
+    name: Quality gate (stack-detected free tools + optional SonarQube)
+    runs-on: ubuntu-latest
+    needs: [verify, integration-tests]
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect tech stack
+        id: stack
+        run: |
+          [ -f package.json ]                                   && echo "stack=nodejs"  >> $GITHUB_OUTPUT || true
+          [ -f pyproject.toml ] || [ -f requirements.txt ]      && echo "stack=python"  >> $GITHUB_OUTPUT || true
+          [ -f pom.xml ]                                         && echo "stack=java"    >> $GITHUB_OUTPUT || true
+          [ -f go.mod ]                                          && echo "stack=go"      >> $GITHUB_OUTPUT || true
+          [ -f Cargo.toml ]                                      && echo "stack=rust"    >> $GITHUB_OUTPUT || true
+          [ -f Gemfile ]                                         && echo "stack=ruby"    >> $GITHUB_OUTPUT || true
+          ls *.sln *.csproj 2>/dev/null                         && echo "stack=dotnet"  >> $GITHUB_OUTPUT || true
+
+      # ── Node.js / TypeScript ──────────────────────────────────────────────
+      - name: Setup Node.js (if Node project)
+        if: steps.stack.outputs.stack == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install deps (Node)
+        if: steps.stack.outputs.stack == 'nodejs'
+        run: npm ci
+
+      - name: ESLint
+        if: steps.stack.outputs.stack == 'nodejs'
+        run: npx eslint . --max-warnings 0
+
+      - name: TypeScript type-check
+        if: steps.stack.outputs.stack == 'nodejs'
+        run: npx tsc --noEmit
+        continue-on-error: false
+
+      - name: Biome check (if configured)
+        if: steps.stack.outputs.stack == 'nodejs'
+        run: '[ -f biome.json ] && npx @biomejs/biome check . || true'
+
+      - name: Knip (dead code / unused exports)
+        if: steps.stack.outputs.stack == 'nodejs'
+        run: npx knip --reporter compact
+        continue-on-error: true
+
+      # ── Python ───────────────────────────────────────────────────────────
+      - name: Setup Python (if Python project)
+        if: steps.stack.outputs.stack == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python analysis tools
+        if: steps.stack.outputs.stack == 'python'
+        run: pip install ruff mypy pylint bandit vulture
+
+      - name: Ruff (lint + format check)
+        if: steps.stack.outputs.stack == 'python'
+        run: ruff check .
+
+      - name: Mypy (type checking)
+        if: steps.stack.outputs.stack == 'python'
+        run: mypy src/ --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Pylint
+        if: steps.stack.outputs.stack == 'python'
+        run: pylint $(find . -name "*.py" | grep -v ".git\|venv\|__pycache__" | head -50) --score=yes
+        continue-on-error: true
+
+      - name: Bandit (Python security)
+        if: steps.stack.outputs.stack == 'python'
+        run: bandit -r . -ll
+
+      - name: Vulture (dead code)
+        if: steps.stack.outputs.stack == 'python'
+        run: vulture . --min-confidence 80
+        continue-on-error: true
+
+      # ── Java / Maven ──────────────────────────────────────────────────────
+      - name: Setup Java (if Java project)
+        if: steps.stack.outputs.stack == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Checkstyle
+        if: steps.stack.outputs.stack == 'java'
+        run: mvn checkstyle:check -q
+
+      - name: SpotBugs
+        if: steps.stack.outputs.stack == 'java'
+        run: mvn spotbugs:check -q
+        continue-on-error: true
+
+      - name: PMD
+        if: steps.stack.outputs.stack == 'java'
+        run: mvn pmd:check -q
+        continue-on-error: true
+
+      # ── Go ────────────────────────────────────────────────────────────────
+      - name: Setup Go (if Go project)
+        if: steps.stack.outputs.stack == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go vet
+        if: steps.stack.outputs.stack == 'go'
+        run: go vet ./...
+
+      - name: golangci-lint
+        if: steps.stack.outputs.stack == 'go'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: staticcheck
+        if: steps.stack.outputs.stack == 'go'
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+        continue-on-error: true
+
+      # ── Rust ─────────────────────────────────────────────────────────────
+      - name: cargo check + clippy (if Rust project)
+        if: steps.stack.outputs.stack == 'rust'
+        run: |
+          cargo check
+          cargo clippy -- -D warnings
+
+      # ── Ruby ─────────────────────────────────────────────────────────────
+      - name: RuboCop (if Ruby project)
+        if: steps.stack.outputs.stack == 'ruby'
+        run: |
+          gem install rubocop --no-document
+          bundle exec rubocop --format progress
+
+      # ── .NET ─────────────────────────────────────────────────────────────
+      - name: dotnet format (if .NET project)
+        if: steps.stack.outputs.stack == 'dotnet'
+        run: |
+          dotnet format --verify-no-changes
+          dotnet build /warnaserror
+
+      # ── Universal: CodeQL (free, all stacks) ─────────────────────────────
+      - name: CodeQL — initialise
+        uses: github/codeql-action/init@v3
+        with:
+          languages: >-
+            ${{ steps.stack.outputs.stack == 'nodejs' && 'javascript' ||
+                steps.stack.outputs.stack == 'python'  && 'python'     ||
+                steps.stack.outputs.stack == 'java'    && 'java'       ||
+                steps.stack.outputs.stack == 'go'      && 'go'         ||
+                steps.stack.outputs.stack == 'ruby'    && 'ruby'       ||
+                steps.stack.outputs.stack == 'dotnet'  && 'csharp'     ||
+                'javascript' }}
+
+      - name: CodeQL — analyse
+        uses: github/codeql-action/analyze@v3
+        # Free on GitHub. No token needed. No server needed.
+
+      # ── Universal: Semgrep (free tier) ───────────────────────────────────
+      - name: Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/secrets
+            ${{ steps.stack.outputs.stack == 'nodejs'  && 'p/javascript' ||
+                steps.stack.outputs.stack == 'python'  && 'p/python'     ||
+                steps.stack.outputs.stack == 'java'    && 'p/java'       ||
+                steps.stack.outputs.stack == 'go'      && 'p/golang'     ||
+                steps.stack.outputs.stack == 'ruby'    && 'p/ruby'       ||
+                '' }}
+        continue-on-error: true
+
+      # ── Architecture tests ────────────────────────────────────────────────
+      - name: Architecture tests (dependency rules)
+        run: |
+          npx depcruise --validate .dependency-cruiser.js src 2>/dev/null || \
+          lint-imports 2>/dev/null || \
+          echo "No architecture tool configured — add dependency-cruiser or import-linter"
+        continue-on-error: true
+
+      # ── SonarQube — OPTIONAL (only runs if SONAR_TOKEN is set) ───────────
+      - name: SonarQube scan (optional)
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube quality gate (optional)
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4 — SECURITY SCAN (every PR)
+# Dependencies, SAST, secrets. Blocks merge on CRITICAL/HIGH findings.
+# ─────────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security scan (CVE + SAST + secrets)
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret scanning (GitLeaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Dependency audit (npm)
+        run: npm audit --audit-level=high
+        # For Python: pip-audit --fail-on-vuln
+        # For Java: mvn org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+
+      - name: Snyk scan (if configured)
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true   # Remove once Snyk token is added
+
+      - name: SAST scan (Semgrep)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/secrets
+            p/javascript
+        # For Python: p/python instead of p/javascript
+        continue-on-error: true
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+        continue-on-error: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 5 — E2E TESTS (merge to main/dev only)
+# Full user journeys. Runs after merge, not on PRs (too slow for PR feedback).
+# ─────────────────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: [quality-gate, security-scan]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Start application
+        run: |
+          npm run build
+          npm start &
+          npx wait-on http://localhost:3000 --timeout 60000
+        env:
+          NODE_ENV: test
+          DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+
+      - name: Run E2E tests
+        run: npx playwright test
+        # For Cypress: npx cypress run --headless
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 6 — DEPLOY TO STAGING (merge to main only)
+# Automatic deploy after all tests pass.
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          # Replace with your deployment command:
+          # ./scripts/deploy.sh staging
+          # heroku container:push web --app my-app-staging
+          # kubectl apply -f k8s/staging/
+          # aws ecs update-service ...
+          echo "Configure your deployment command here"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          ENVIRONMENT: staging
+
+      - name: Smoke test — staging
+        run: |
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          echo "Running smoke tests against $STAGING_URL"
+
+          # Health check
+          status=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/health" 2>/dev/null || \
+                   curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/api/health" 2>/dev/null)
+          [ "$status" = "200" ] && echo "✅ Health check passed" || (echo "❌ Health check FAILED (status: $status)" && exit 1)
+
+          # Application responds
+          status=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/" 2>/dev/null)
+          [ "$status" -lt "500" ] && echo "✅ Application responds" || (echo "❌ Application returned $status" && exit 1)
+
+          echo "✅ Staging smoke tests passed"
+
+      - name: Rollback on smoke test failure
+        if: failure()
+        run: |
+          echo "🚨 Smoke test failed — triggering rollback"
+          # ./scripts/deploy.sh staging rollback
+          # heroku rollback --app my-app-staging
+          echo "Configure your rollback command here"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 7 — DEPLOY TO PRODUCTION (manual approval required)
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production           # Requires manual approval in GitHub Environments
+      url: ${{ secrets.PRODUCTION_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          # ./scripts/deploy.sh production
+          echo "Configure your production deployment command here"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          ENVIRONMENT: production
+
+      - name: Smoke test — production
+        run: |
+          PROD_URL="${{ secrets.PRODUCTION_URL }}"
+          status=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$PROD_URL/health" 2>/dev/null)
+          [ "$status" = "200" ] && echo "✅ Production health check passed" || \
+            (echo "❌ Production health check FAILED — ROLLBACK IMMEDIATELY" && exit 1)
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "🚨 Production smoke test failed — rolling back"
+          # ./scripts/deploy.sh production rollback
+          echo "Configure your rollback command here"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 8 — WEEKLY TESTS (scheduled: Monday 2am UTC)
+# Mutation tests, chaos tests, NFR/load tests.
+# Too slow/expensive to run on every PR.
+# ─────────────────────────────────────────────────────────────────────────────
+  mutation-tests:
+    name: Mutation tests (weekly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Run Stryker mutation tests
+        run: npx stryker run
+        # For Java: mvn org.pitest:pitest-maven:mutationCoverage
+        # For Python: mutmut run --paths-to-mutate src/services/,src/domain/
+        timeout-minutes: 60
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/
+          retention-days: 30
+
+      - name: Comment mutation score on last PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const report = JSON.parse(fs.readFileSync('reports/mutation/report.json', 'utf8'));
+              const score = report.mutationScore || 'unknown';
+              console.log(`Mutation score: ${score}%`);
+              // Post to Slack or create an issue if score drops below threshold
+            } catch(e) {
+              console.log('Could not read mutation report');
+            }
+
+  nfr-tests:
+    name: NFR tests — load + accessibility (weekly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Start application
+        run: |
+          npm run build && npm start &
+          npx wait-on http://localhost:3000 --timeout 60000
+        env:
+          NODE_ENV: staging
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install k6
+
+      - name: Load test
+        run: |
+          k6 run tests/load/smoke.js --out json=reports/k6-results.json
+          # Artillery: npx artillery run tests/load/load-test.yml
+        continue-on-error: true
+
+      - name: Accessibility audit (axe + Lighthouse)
+        run: |
+          npx @axe-core/cli http://localhost:3000 --save reports/axe-results.json
+          npx lighthouse http://localhost:3000 \
+            --only-categories=accessibility,performance \
+            --output=json --output-path=reports/lighthouse.json --quiet
+        continue-on-error: true
+
+      - name: Upload NFR reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nfr-reports
+          path: reports/
+          retention-days: 30

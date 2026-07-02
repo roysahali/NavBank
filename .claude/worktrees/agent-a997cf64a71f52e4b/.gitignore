@@ -1,0 +1,38 @@
+# Claude Code — personal, never commit
+.claude/memory/
+.claude/todos/
+*.claude-session
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+frontend/dist/
+frontend/coverage/
+
+# Python
+backend/.venv/
+backend/venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.mypy_cache/
+.ruff_cache/
+backend/.coverage
+backend/htmlcov/
+backend/.pytest_cache/
+
+# Environment
+.env
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo

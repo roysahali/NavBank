@@ -1,0 +1,556 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code Starter Kit — GitLab CI/CD Pipeline
+#
+# SETUP REQUIRED (GitLab → Settings → CI/CD → Variables):
+#
+#   Required for all projects:
+#   SONAR_TOKEN          → SonarQube token
+#   SONAR_HOST_URL       → Your SonarQube URL
+#
+#   Required for deployment:
+#   STAGING_URL          → Staging environment URL
+#   PRODUCTION_URL       → Production environment URL
+#   DEPLOY_KEY           → Deployment secret
+#
+#   Optional:
+#   SNYK_TOKEN           → Snyk vulnerability scanning
+#   PACT_BROKER_URL      → Contract testing broker
+#   PACT_BROKER_TOKEN    → Contract testing token
+#
+# CUSTOMISE FOR YOUR STACK:
+#   1. Replace npm commands with your package manager
+#   2. Change the image: to match your runtime
+#   3. Add/remove jobs based on your project
+# ─────────────────────────────────────────────────────────────────────────────
+
+image: node:20-alpine
+
+# Pipeline stages — run in this order
+stages:
+  - verify          # Every commit: fast checks
+  - test            # Every PR/MR: full tests
+  - quality         # Every PR/MR: static analysis + security
+  - build           # Every push to main: build artefacts
+  - deploy-staging  # Every push to main: auto-deploy staging
+  - smoke           # After every deploy: health check
+  - deploy-prod     # Manual approval: production deploy
+  - weekly          # Scheduled: mutation + nfr
+
+# ── Shared config ─────────────────────────────────────────────────────────────
+variables:
+  NODE_ENV: test
+  FF_USE_FASTZIP: "true"
+  CACHE_COMPRESSION_LEVEL: "fastest"
+
+# Cache node_modules across jobs
+.node_cache: &node_cache
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: pull
+
+.node_cache_push: &node_cache_push
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: push
+
+# Only run on MR or main/dev branches (skip feature branch pushes without MR)
+.on_mr_or_main: &on_mr_or_main
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $CI_COMMIT_BRANCH == 'dev'
+
+.on_main_only: &on_main_only
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+.weekly_only: &weekly_only
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — VERIFY (every commit, < 5 min)
+# ─────────────────────────────────────────────────────────────────────────────
+install:
+  stage: verify
+  <<: *node_cache_push
+  rules:
+    - when: always
+  script:
+    - npm ci
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+
+lint:
+  stage: verify
+  <<: *node_cache
+  needs: [install]
+  rules:
+    - when: always
+  script:
+    - npm run lint
+    - npm run type-check
+    # For Python: pip install ruff mypy && ruff check . && mypy src/
+  allow_failure: false
+
+unit-tests:
+  stage: verify
+  <<: *node_cache
+  needs: [install]
+  rules:
+    - when: always
+  script:
+    - npm run test:unit -- --coverage
+    # For Python: pytest tests/unit/ --tb=short --cov=src --cov-report=xml
+    # For Java: mvn test -Dtest="**/*UnitTest"
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit:
+        - junit.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — TEST (every MR, needs real services)
+# ─────────────────────────────────────────────────────────────────────────────
+integration-tests:
+  stage: test
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [lint, unit-tests]
+
+  services:
+    - name: postgres:16
+      alias: postgres
+      variables:
+        POSTGRES_DB: test_db
+        POSTGRES_USER: test_user
+        POSTGRES_PASSWORD: test_password
+    - name: redis:7
+      alias: redis
+    # Uncomment for RabbitMQ:
+    # - name: rabbitmq:3-management
+    #   alias: rabbitmq
+
+  variables:
+    DATABASE_URL: postgresql://test_user:test_password@postgres:5432/test_db
+    REDIS_URL: redis://redis:6379
+
+  script:
+    - npm run migrate
+    - npm run test:integration
+    # - pytest tests/integration/ --tb=short
+    # - mvn test -Dtest="**/*IntegrationTest"
+
+  artifacts:
+    when: always
+    reports:
+      junit: junit-integration.xml
+    expire_in: 7 days
+
+contract-tests:
+  stage: test
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [integration-tests]
+  variables:
+    PACT_BROKER_URL: $PACT_BROKER_URL
+    PACT_BROKER_TOKEN: $PACT_BROKER_TOKEN
+  script:
+    - npm run test:contract
+    # - python -m pytest tests/contract/
+  allow_failure: true   # Remove once Pact is configured
+
+data-tests:
+  stage: test
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [integration-tests]
+  services:
+    - name: postgres:16
+      alias: postgres
+      variables:
+        POSTGRES_DB: test_db
+        POSTGRES_USER: test_user
+        POSTGRES_PASSWORD: test_password
+  variables:
+    DATABASE_URL: postgresql://test_user:test_password@postgres:5432/test_db
+  script:
+    - npm run test:data
+    # - pytest tests/data/ --tb=short
+    # - dbt test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      changes:
+        - "**/migrations/**"
+        - "**/schema*"
+        - "**/*.sql"
+        - "**/prisma/**"
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — QUALITY + SECURITY (every MR)
+# Parallel execution — saves time.
+# ─────────────────────────────────────────────────────────────────────────────
+# Detect stack and run appropriate free tools — SonarQube is optional
+.detect_stack: &detect_stack
+  - |
+    [ -f package.json ]                                && export STACK=nodejs  || true
+    [ -f pyproject.toml ] || [ -f requirements.txt ]   && export STACK=python  || true
+    [ -f pom.xml ]                                     && export STACK=java    || true
+    [ -f go.mod ]                                      && export STACK=go      || true
+    [ -f Cargo.toml ]                                  && export STACK=rust    || true
+    [ -f Gemfile ]                                     && export STACK=ruby    || true
+    ls *.sln *.csproj 2>/dev/null                      && export STACK=dotnet  || true
+    echo "Stack detected: $STACK"
+
+quality-gate-node:
+  stage: quality
+  image: node:20-alpine
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [integration-tests]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+        - package.json
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - package.json
+  script:
+    - npm ci
+    - npx eslint . --max-warnings 0
+    - npx tsc --noEmit
+    - '[ -f biome.json ] && npx @biomejs/biome check . || true'
+    - npx knip --reporter compact || true
+    - npx semgrep --config p/owasp-top-ten --config p/javascript . --quiet || true
+
+quality-gate-python:
+  stage: quality
+  image: python:3.12-slim
+  <<: *on_mr_or_main
+  needs: [integration-tests]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+        - pyproject.toml
+        - requirements.txt
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - pyproject.toml
+  script:
+    - pip install ruff mypy pylint bandit vulture --quiet
+    - ruff check .
+    - mypy src/ --ignore-missing-imports || true
+    - pylint $(find . -name "*.py" | grep -v ".git\|venv\|__pycache__" | head -50) --score=yes || true
+    - bandit -r . -ll
+    - vulture . --min-confidence 80 || true
+    - pip install semgrep --quiet && semgrep --config p/python . --quiet || true
+
+quality-gate-java:
+  stage: quality
+  image: maven:3.9-eclipse-temurin-21
+  <<: *on_mr_or_main
+  needs: [integration-tests]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+        - pom.xml
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - pom.xml
+  script:
+    - mvn checkstyle:check -q
+    - mvn spotbugs:check -q || true
+    - mvn pmd:check -q || true
+
+quality-gate-go:
+  stage: quality
+  image: golang:1.22-alpine
+  <<: *on_mr_or_main
+  needs: [integration-tests]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+        - go.mod
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - go.mod
+  script:
+    - go vet ./...
+    - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    - golangci-lint run
+    - go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck ./... || true
+
+quality-gate-rust:
+  stage: quality
+  image: rust:latest
+  <<: *on_mr_or_main
+  needs: [integration-tests]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+        - Cargo.toml
+  script:
+    - cargo check
+    - cargo clippy -- -D warnings
+
+semgrep:
+  stage: quality
+  image: returntocorp/semgrep
+  <<: *on_mr_or_main
+  needs: []
+  script:
+    - semgrep ci --config p/owasp-top-ten --config p/secrets
+  allow_failure: true
+
+# SonarQube — OPTIONAL: only add this job if you have a SonarQube instance
+# Remove the comment markers below to enable:
+# sonarqube:
+#   stage: quality
+#   image:
+#     name: sonarsource/sonar-scanner-cli:latest
+#     entrypoint: [""]
+#   <<: *on_mr_or_main
+#   needs: [integration-tests]
+#   variables:
+#     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+#     GIT_DEPTH: "0"
+#   rules:
+#     - if: $SONAR_TOKEN != null && ($CI_PIPELINE_SOURCE == 'merge_request_event' || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+#   cache:
+#     key: "${CI_JOB_NAME}"
+#     paths: [.sonar/cache]
+#   script:
+#     - sonar-scanner
+#         -Dsonar.projectKey=${CI_PROJECT_PATH_SLUG}
+#         -Dsonar.sources=.
+#         -Dsonar.host.url=${SONAR_HOST_URL}
+#         -Dsonar.token=${SONAR_TOKEN}
+#         -Dsonar.qualitygate.wait=true
+
+architecture-tests:
+  stage: quality
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [lint]
+  script:
+    - |
+      npx depcruise --validate .dependency-cruiser.js src 2>/dev/null || \
+      lint-imports 2>/dev/null || \
+      echo "No architecture test tool found — add dependency-cruiser or import-linter"
+  allow_failure: true
+
+secret-scanning:
+  stage: quality
+  needs: []   # Runs immediately, no dependencies
+  rules:
+    - when: always
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --source . --verbose --log-level warn
+  allow_failure: false   # Secrets = always block
+
+dependency-audit:
+  stage: quality
+  <<: [*node_cache, *on_mr_or_main]
+  needs: [install]
+  script:
+    - npm audit --audit-level=high
+    # - pip-audit --fail-on-vuln
+    # - mvn org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+  allow_failure: false
+
+sast:
+  stage: quality
+  <<: *on_mr_or_main
+  needs: []
+  image: returntocorp/semgrep
+  script:
+    - semgrep ci --config p/owasp-top-ten --config p/secrets
+    # Adjust config: p/python, p/java, p/golang as needed
+  allow_failure: true   # Remove once Semgrep baseline is established
+
+# GitLab built-in SAST (if on GitLab Ultimate)
+# include:
+#   - template: Security/SAST.gitlab-ci.yml
+#   - template: Security/Secret-Detection.gitlab-ci.yml
+#   - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — BUILD (main branch only)
+# ─────────────────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  <<: [*node_cache, *on_main_only]
+  needs: [quality-gate, dependency-audit, secret-scanning]
+  script:
+    - npm run build
+    # - python setup.py bdist_wheel
+    # - mvn package -DskipTests
+  artifacts:
+    paths:
+      - dist/
+      - build/
+      # - target/*.jar
+    expire_in: 1 week
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5 — DEPLOY STAGING (main branch, auto)
+# ─────────────────────────────────────────────────────────────────────────────
+deploy-staging:
+  stage: deploy-staging
+  <<: *on_main_only
+  needs: [build]
+  environment:
+    name: staging
+    url: $STAGING_URL
+  script:
+    - |
+      # Replace with your deployment command:
+      # ./scripts/deploy.sh staging
+      # heroku container:push web --app my-app-staging
+      # kubectl apply -f k8s/staging/ --namespace staging
+      echo "Configure your staging deployment command here"
+  variables:
+    ENVIRONMENT: staging
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 6 — SMOKE TEST (after every deploy)
+# ─────────────────────────────────────────────────────────────────────────────
+smoke-test-staging:
+  stage: smoke
+  <<: *on_main_only
+  needs: [deploy-staging]
+  image: alpine/curl:latest
+  script:
+    - |
+      echo "Running smoke tests against $STAGING_URL"
+      RETRIES=5
+      for i in $(seq 1 $RETRIES); do
+        status=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/health" 2>/dev/null || \
+                 curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/api/health" 2>/dev/null)
+        if [ "$status" = "200" ]; then
+          echo "✅ Health check passed (attempt $i)"
+          break
+        fi
+        echo "Attempt $i: status=$status — retrying in 10s..."
+        [ $i -eq $RETRIES ] && echo "❌ Smoke test FAILED after $RETRIES attempts" && exit 1
+        sleep 10
+      done
+
+      # Application root responds
+      status=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$STAGING_URL/" 2>/dev/null)
+      [ "$status" -lt "500" ] && echo "✅ Application responds ($status)" || \
+        (echo "❌ Application returned $status" && exit 1)
+
+      echo "✅ All smoke tests passed"
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        echo "🚨 Smoke test failed — triggering rollback"
+        # ./scripts/deploy.sh staging rollback
+      fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 7 — DEPLOY PRODUCTION (manual approval)
+# ─────────────────────────────────────────────────────────────────────────────
+deploy-production:
+  stage: deploy-prod
+  <<: *on_main_only
+  needs: [smoke-test-staging]
+  environment:
+    name: production
+    url: $PRODUCTION_URL
+  when: manual    # ← Requires manual approval in GitLab UI
+  script:
+    - |
+      # ./scripts/deploy.sh production
+      echo "Configure your production deployment command here"
+  variables:
+    ENVIRONMENT: production
+
+smoke-test-production:
+  stage: deploy-prod
+  <<: *on_main_only
+  needs: [deploy-production]
+  image: alpine/curl:latest
+  script:
+    - |
+      echo "Running production smoke tests"
+      status=$(curl -sf --max-time 15 -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health")
+      [ "$status" = "200" ] && echo "✅ Production health check passed" || \
+        (echo "❌ Production health check FAILED — ROLLBACK NOW" && exit 1)
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        echo "🚨 PRODUCTION SMOKE TEST FAILED"
+        # ./scripts/deploy.sh production rollback
+      fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 8 — WEEKLY TESTS (scheduled pipeline)
+# Configure: GitLab → CI/CD → Schedules → every Monday at 2am
+# ─────────────────────────────────────────────────────────────────────────────
+mutation-tests:
+  stage: weekly
+  <<: [*node_cache, *weekly_only]
+  needs: []
+  timeout: 90 minutes
+  script:
+    - npm ci
+    - npx stryker run
+    # - mutmut run --paths-to-mutate src/services/,src/domain/
+    # - mvn org.pitest:pitest-maven:mutationCoverage
+  artifacts:
+    paths:
+      - reports/mutation/
+    expire_in: 30 days
+    when: always
+
+nfr-load-tests:
+  stage: weekly
+  <<: *weekly_only
+  needs: []
+  image: grafana/k6:latest
+  script:
+    - k6 run tests/load/smoke.js --out json=reports/k6-results.json
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 30 days
+    when: always
+  allow_failure: true
+
+accessibility-audit:
+  stage: weekly
+  <<: [*node_cache, *weekly_only]
+  needs: []
+  services:
+    - name: your-app-image:latest   # Replace with your Docker image
+      alias: app
+  script:
+    - npm ci
+    - npx @axe-core/cli http://app:3000 --save reports/axe-results.json
+    - npx lighthouse http://app:3000
+        --only-categories=accessibility,performance
+        --output=json --output-path=reports/lighthouse.json --quiet
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 30 days
+    when: always
+  allow_failure: true
